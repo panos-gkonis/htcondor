@@ -316,8 +316,8 @@ public:
 	bool asyncUserLogRequested() const;
 	bool asyncUserLogEnabled() const { return m_async_command_fd >= 0; }
 	bool prepareAsyncUserLog();
-	bool queueAsyncUserLogCommand(const WriteUserLog::log_file& log, const char *op,
-		const std::string *payload, bool fsync);
+	bool queueAsyncUserLogWrite(const WriteUserLog::log_file& log,
+		const std::string &payload);
 	bool queueAsyncWriteEvent(const WriteUserLog::log_file& log, ULogEvent *event, int format_opts);
 	void writeJobAdInfoEvent(char const *attrsToWrite,
 		WriteUserLog::log_file& log, ULogEvent *event, const ClassAd *param_jobad,
@@ -358,8 +358,6 @@ public:
 	/** Mask for events              */  std::vector<ULogEventNumber> mask;
 
 	int        m_async_command_fd;
-	std::string m_async_writer_id;
-	unsigned long long m_async_command_sequence;
 	uid_t      m_async_target_uid;
 	gid_t      m_async_target_gid;
 };

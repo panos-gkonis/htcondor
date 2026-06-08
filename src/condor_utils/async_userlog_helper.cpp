@@ -9,7 +9,6 @@
 #include "basename.h"
 #include "classad/jsonSource.h"
 
-#include <map>
 #include <string>
 
 #include <linux/falloc.h>
@@ -17,24 +16,6 @@
 #if !defined(SEEK_DATA)
 #define SEEK_DATA 3
 #endif
-
-struct CachedLog {
-	int fd = -1;
-	std::string path;
-	uid_t uid = (uid_t)-1;
-	gid_t gid = (gid_t)-1;
-};
-
-static mode_t
-parse_octal_mode(const std::string &text, mode_t fallback)
-{
-	char *end = nullptr;
-	long value = strtol(text.c_str(), &end, 8);
-	if (!end || *end != '\0' || value < 0) {
-		return fallback;
-	}
-	return (mode_t)value;
-}
 
 static bool
 lookup_required_string(classad::ClassAd &ad, const char *attr, std::string &value)
@@ -114,32 +95,43 @@ ensure_parent_dir(const std::string &path, mode_t mode, uid_t uid, gid_t gid)
 }
 
 static bool
-open_target(CachedLog &log, mode_t create_mode, mode_t dir_mode)
+write_target(const std::string &path, uid_t uid, gid_t gid, const std::string &payload)
 {
-	if (log.fd >= 0) {
-		return true;
-	}
-	if (!ensure_parent_dir(log.path, dir_mode, log.uid, log.gid)) {
+	if (!ensure_parent_dir(path, 0755, uid, gid)) {
 		return false;
 	}
+
 	uid_t old_uid = 0;
 	gid_t old_gid = 0;
-	if (!switch_identity(log.uid, log.gid, old_uid, old_gid)) {
+	if (!switch_identity(uid, gid, old_uid, old_gid)) {
 		return false;
 	}
-	log.fd = safe_open_wrapper_follow(log.path.c_str(),
-		O_WRONLY | O_CREAT | O_APPEND, create_mode);
-	restore_identity(old_uid, old_gid);
-	if (log.fd < 0) {
+	int fd = safe_open_wrapper_follow(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0664);
+
+	if (fd < 0) {
 		dprintf(D_ALWAYS, "async user log helper: open(%s) failed: errno %d (%s)\n",
-			log.path.c_str(), errno, strerror(errno));
+			path.c_str(), errno, strerror(errno));
+		restore_identity(old_uid, old_gid);
 		return false;
 	}
-	return true;
+
+	bool ok = true;
+	if (write(fd, payload.data(), payload.length()) != (ssize_t)payload.length()) {
+		dprintf(D_ALWAYS, "async user log helper: write(%s) failed: errno %d (%s)\n",
+			path.c_str(), errno, strerror(errno));
+		ok = false;
+	}
+	if (close(fd) != 0) {
+		dprintf(D_ALWAYS, "async user log helper: close(%s) failed: errno %d (%s)\n",
+			path.c_str(), errno, strerror(errno));
+		ok = false;
+	}
+	restore_identity(old_uid, old_gid);
+	return ok;
 }
 
 static bool
-process_command(const std::string &line, std::map<std::string, CachedLog> &logs)
+process_command(const std::string &line)
 {
 	classad::ClassAd ad;
 	classad::ClassAdJsonParser parser;
@@ -148,16 +140,10 @@ process_command(const std::string &line, std::map<std::string, CachedLog> &logs)
 		return false;
 	}
 
-	long long version = 0;
 	long long uid = -1;
 	long long gid = -1;
-	std::string log_id;
-	std::string op;
 	std::string path;
-	if (!lookup_required_int(ad, "Version", version) || version != 1 ||
-		!lookup_required_string(ad, "LogId", log_id) ||
-		!lookup_required_string(ad, "Op", op) ||
-		!lookup_required_string(ad, "Path", path) ||
+	if (!lookup_required_string(ad, "Path", path) ||
 		!lookup_required_int(ad, "Uid", uid) ||
 		!lookup_required_int(ad, "Gid", gid)) {
 		return false;
@@ -170,61 +156,13 @@ process_command(const std::string &line, std::map<std::string, CachedLog> &logs)
 		dprintf(D_ALWAYS, "async user log helper: invalid uid/gid %lld/%lld\n", uid, gid);
 		return false;
 	}
-	if (op != "open" && op != "close" && op != "write") {
-		dprintf(D_ALWAYS, "async user log helper: invalid Op %s\n", op.c_str());
+
+	std::string payload;
+	if (!ad.LookupString("Payload", payload)) {
+		dprintf(D_ALWAYS, "async user log helper: write missing Payload\n");
 		return false;
 	}
-
-	if (op == "close") {
-		auto it = logs.find(log_id);
-		if (it != logs.end()) {
-			if (it->second.fd >= 0) {
-				close(it->second.fd);
-			}
-			logs.erase(it);
-		}
-		return true;
-	}
-
-	std::string create_mode_text = "0664";
-	std::string dir_mode_text = "0755";
-	ad.LookupString("CreateMode", create_mode_text);
-	ad.LookupString("DirMode", dir_mode_text);
-	mode_t create_mode = parse_octal_mode(create_mode_text, 0664);
-	mode_t dir_mode = parse_octal_mode(dir_mode_text, 0755);
-
-	CachedLog &log = logs[log_id];
-	log.path = path;
-	log.uid = (uid_t)uid;
-	log.gid = (gid_t)gid;
-
-	if (op == "open") {
-		return open_target(log, create_mode, dir_mode);
-	}
-	if (op == "write") {
-		std::string payload;
-		bool fsync = false;
-		if (!ad.LookupString("Payload", payload)) {
-			dprintf(D_ALWAYS, "async user log helper: write missing Payload\n");
-			return false;
-		}
-		ad.LookupBool("Fsync", fsync);
-		if (!open_target(log, create_mode, dir_mode)) {
-			return false;
-		}
-		if (write(log.fd, payload.data(), payload.length()) != (ssize_t)payload.length()) {
-			dprintf(D_ALWAYS, "async user log helper: write(%s) failed: errno %d (%s)\n",
-				log.path.c_str(), errno, strerror(errno));
-			return false;
-		}
-		if (fsync && condor_fdatasync(log.fd, log.path.c_str()) != 0) {
-			dprintf(D_ALWAYS, "async user log helper: fsync(%s) failed: errno %d (%s)\n",
-				log.path.c_str(), errno, strerror(errno));
-			return false;
-		}
-		return true;
-	}
-	return false;
+	return write_target(path, (uid_t)uid, (gid_t)gid, payload);
 }
 
 static off_t
@@ -321,7 +259,6 @@ main(int argc, char **argv)
 		lseek(fd, 0, SEEK_SET);
 	}
 
-	std::map<std::string, CachedLog> logs;
 	std::string buffer;
 	char chunk[8192];
 	while (true) {
@@ -344,16 +281,11 @@ main(int argc, char **argv)
 			std::string line = buffer.substr(0, newline);
 			buffer.erase(0, newline + 1);
 			offset += newline + 1;
-			process_command(line, logs);
+			process_command(line);
 			commit_command_offset(fd, command_path, offset);
 		}
 	}
 
-	for (auto &entry : logs) {
-		if (entry.second.fd >= 0) {
-			close(entry.second.fd);
-		}
-	}
 	close(fd);
 	return 0;
 }
