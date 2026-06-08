@@ -70,7 +70,7 @@ restore_identity(uid_t old_uid, gid_t old_gid)
 }
 
 static bool
-ensure_parent_dir(const std::string &path, mode_t mode, uid_t uid, gid_t gid)
+ensure_parent_dir(const std::string &path, mode_t mode)
 {
 	size_t pos = path.find_last_of("/\\");
 	if (pos == std::string::npos) {
@@ -80,13 +80,7 @@ ensure_parent_dir(const std::string &path, mode_t mode, uid_t uid, gid_t gid)
 	if (dir.empty()) {
 		return true;
 	}
-	uid_t old_uid = 0;
-	gid_t old_gid = 0;
-	if (!switch_identity(uid, gid, old_uid, old_gid)) {
-		return false;
-	}
 	bool ok = mkdir_and_parents_if_needed(dir.c_str(), mode, PRIV_UNKNOWN);
-	restore_identity(old_uid, old_gid);
 	if (!ok) {
 		dprintf(D_ALWAYS, "async user log helper: failed to create directory %s: errno %d (%s)\n",
 			dir.c_str(), errno, strerror(errno));
@@ -97,13 +91,13 @@ ensure_parent_dir(const std::string &path, mode_t mode, uid_t uid, gid_t gid)
 static bool
 write_target(const std::string &path, uid_t uid, gid_t gid, const std::string &payload)
 {
-	if (!ensure_parent_dir(path, 0755, uid, gid)) {
-		return false;
-	}
-
 	uid_t old_uid = 0;
 	gid_t old_gid = 0;
 	if (!switch_identity(uid, gid, old_uid, old_gid)) {
+		return false;
+	}
+	if (!ensure_parent_dir(path, 0755)) {
+		restore_identity(old_uid, old_gid);
 		return false;
 	}
 	int fd = safe_open_wrapper_follow(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0664);

@@ -37,6 +37,7 @@
 #include "directory.h"
 #include "classad/jsonSink.h"
 #include "condor_daemon_core.h"
+#include "subsystem_info.h"
 
 #include <string>
 #include <algorithm>
@@ -44,7 +45,6 @@
 
 static pid_t async_userlog_helper_pid = 0;
 static int async_userlog_helper_reaper = -1;
-static std::string async_userlog_configured_command_path;
 static std::string async_userlog_helper_command_path;
 
 static bool start_async_userlog_helper();
@@ -312,15 +312,10 @@ WriteUserLog::initialize( const std::vector<const char *>& file, int c, int p, i
 		// Save parameter info
 	FreeLocalResources( );
 	Configure(false);
-	bool use_async = asyncUserLogRequested();
+	bool use_async = asyncUserLogRequested() && m_set_user_priv && user_ids_are_inited();
 	if (use_async) {
-		if (m_set_user_priv && user_ids_are_inited()) {
-			m_async_target_uid = get_user_uid();
-			m_async_target_gid = get_user_gid();
-		} else {
-			m_async_target_uid = geteuid();
-			m_async_target_gid = getegid();
-		}
+		m_async_target_uid = get_user_uid();
+		m_async_target_gid = get_user_gid();
 	}
 	if (use_async && !prepareAsyncUserLog()) {
 		dprintf(D_ALWAYS, "WriteUserLog::initialize: async user log setup failed\n");
@@ -351,6 +346,10 @@ WriteUserLog::initialize( const std::vector<const char *>& file, int c, int p, i
 			if (std::distance(it,file.end()) == 1 && !mask.empty()) { log->is_dag_log = true; }
 
 			if (use_async) {
+				if (strcmp(log->path.c_str(), UNIX_NULL_FILE) == 0) {
+					delete log;
+					continue;
+				}
 				logs.push_back(log);
 				continue;
 			}
@@ -455,13 +454,6 @@ WriteUserLog::Configure( bool force )
 
 	m_skip_fsync_this_event = false;
 	m_enable_locking = param_boolean( "ENABLE_USERLOG_LOCKING", false );
-	auto_free_ptr async_command_path(param("ASYNC_USERLOG_COMMAND_FILE"));
-	if (async_command_path && async_userlog_configured_command_path.empty()) {
-		async_userlog_configured_command_path = async_command_path.ptr();
-	} else if (async_command_path && strcmp(async_command_path.ptr(), async_userlog_configured_command_path.c_str()) != 0) {
-		dprintf(D_ALWAYS, "WriteUserLog: ignoring reconfigured ASYNC_USERLOG_COMMAND_FILE=%s; using initial value %s\n",
-			async_command_path.ptr(), async_userlog_configured_command_path.c_str());
-	}
 
 	// TODO: revisit this if we let the job choose to enable or disable UTC, SUB_SECOND or ISO_DATE
 	// if we are merging job and defult flags, we need to do a better job than this.
@@ -1494,8 +1486,10 @@ WriteUserLog::doWriteEvent( int fd, ULogEvent *event, int format_opts )
 bool
 WriteUserLog::asyncUserLogRequested() const
 {
+	SubsystemInfo *subsys = get_mySubSystem();
 	auto_free_ptr helper(param("ASYNC_USERLOG_HELPER"));
-	return m_userlog_enable && daemonCore && helper && helper.ptr()[0];
+	return m_userlog_enable && daemonCore && subsys && subsys->isType(SUBSYSTEM_TYPE_SCHEDD) &&
+		helper && helper.ptr()[0];
 }
 
 bool
@@ -1507,11 +1501,19 @@ WriteUserLog::prepareAsyncUserLog()
 	if (!asyncUserLogRequested()) {
 		return false;
 	}
-	if (async_userlog_configured_command_path.empty()) {
+	auto_free_ptr async_command_path(param("ASYNC_USERLOG_COMMAND_FILE"));
+	if (!async_command_path || !async_command_path.ptr()[0]) {
+		dprintf(D_ALWAYS, "WriteUserLog: ASYNC_USERLOG_COMMAND_FILE is not configured\n");
 		return false;
 	}
+	if (async_userlog_helper_command_path.empty()) {
+		async_userlog_helper_command_path = async_command_path.ptr();
+	} else if (strcmp(async_command_path.ptr(), async_userlog_helper_command_path.c_str()) != 0) {
+		dprintf(D_ALWAYS, "WriteUserLog: ignoring reconfigured ASYNC_USERLOG_COMMAND_FILE=%s; using initial value %s\n",
+			async_command_path.ptr(), async_userlog_helper_command_path.c_str());
+	}
 
-	std::string dir = async_userlog_configured_command_path;
+	std::string dir = async_userlog_helper_command_path;
 	size_t pos = dir.find_last_of("/\\");
 	if (pos != std::string::npos) {
 		dir.erase(pos);
@@ -1523,15 +1525,14 @@ WriteUserLog::prepareAsyncUserLog()
 	}
 
 	priv_state priv = set_condor_priv();
-	m_async_command_fd = safe_open_wrapper_follow(async_userlog_configured_command_path.c_str(),
+	m_async_command_fd = safe_open_wrapper_follow(async_userlog_helper_command_path.c_str(),
 		O_WRONLY | O_CREAT | O_APPEND, 0664);
 	set_priv(priv);
 	if (m_async_command_fd < 0) {
 		dprintf(D_ALWAYS, "WriteUserLog: failed to open async command file %s: errno %d (%s)\n",
-			async_userlog_configured_command_path.c_str(), errno, strerror(errno));
+			async_userlog_helper_command_path.c_str(), errno, strerror(errno));
 		return false;
 	}
-	async_userlog_helper_command_path = async_userlog_configured_command_path;
 	if (!start_async_userlog_helper()) {
 		close(m_async_command_fd);
 		m_async_command_fd = -1;
@@ -1650,9 +1651,6 @@ WriteUserLog::writeEvent ( ULogEvent *event,
 	if ( m_userlog_enable ) {
 		const bool use_async = asyncUserLogEnabled();
 		for(std::vector<log_file*>::iterator p = logs.begin(); p != logs.end(); ++p) {
-			if (strcmp((*p)->path.c_str(), UNIX_NULL_FILE) == 0) {
-				continue;
-			}
 			if( !use_async && ((*p)->fd < 0 || !(*p)->lock)) {
 				if((*p)->fd >= 0) {
 					dprintf( D_ALWAYS, "WriteUserLog: No user log lock!\n" );
