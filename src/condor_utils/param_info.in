@@ -2469,6 +2469,16 @@ default=false
 type=bool
 tags=read_user_log
 
+[ASYNC_USERLOG_COMMAND_FILE]
+default=$(SPOOL)/userlog_commands.jsonl
+type=string
+tags=user_log
+
+[ASYNC_USERLOG_HELPER]
+default=
+type=string
+tags=user_log
+
 [EVENT_LOG]
 default=
 type=string
@@ -7449,4 +7459,3 @@ default : @fin
 @fin
 
 # ^^^^ TJ SEZ: do NOT insert new param knobs here. insert meta knobs just above this banner, and regular knobs near to related knobs way up there ^^^^
-

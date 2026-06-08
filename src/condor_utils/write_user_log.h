@@ -96,6 +96,7 @@ class WriteUserLog
     /** Whether to use user priv     */  bool user_priv_flag;
     /** Whether or not is DAGMan log */  bool is_dag_log;
     /** Whether to fsync (fdatasync) */  bool should_fsync;
+    /** Stable async target id       */  std::string log_id;
 
       log_file(const char* p) : path(p), lock(NULL), fd(-1),
         copied(false), user_priv_flag(false), is_dag_log(false), should_fsync(true) {}
@@ -311,6 +312,15 @@ public:
 		bool is_global_event,
 		bool is_header_event,
 		int format_opts);
+
+	// Async user-log command channel internals.
+	bool asyncUserLogRequested() const;
+	bool asyncUserLogEnabled() const { return m_async_command_fd >= 0; }
+	bool prepareAsyncUserLog();
+	bool queueAsyncUserLogCommand(const WriteUserLog::log_file& log, const char *op,
+		const std::string *payload, bool fsync);
+	bool queueAsyncWriteEvent(const WriteUserLog::log_file& log, ULogEvent *event, int format_opts);
+	void assignAsyncLogId(WriteUserLog::log_file& log);
 	void writeJobAdInfoEvent(char const *attrsToWrite,
 		WriteUserLog::log_file& log, ULogEvent *event, const ClassAd *param_jobad,
 		bool is_global_event, int format_opts );
@@ -348,6 +358,14 @@ public:
 	/** switch to user priv?         */  bool       m_set_user_priv;
 	/** Creator Name (schedd name)   */  char     * m_creator_name;
 	/** Mask for events              */  std::vector<ULogEventNumber> mask;
+
+	char     * m_async_command_path;
+	int        m_async_command_fd;
+	std::string m_async_writer_id;
+	unsigned long long m_async_command_sequence;
+	unsigned long long m_async_log_sequence;
+	uid_t      m_async_target_uid;
+	gid_t      m_async_target_gid;
 };
 
 // Simple class to extract info from a log file header event
