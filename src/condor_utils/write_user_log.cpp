@@ -322,8 +322,22 @@ WriteUserLog::initialize( const std::vector<const char *>& file, int c, int p, i
 		return false;
 	}
 
+	if (m_userlog_enable && use_async) {
+		for (std::vector<const char*>::const_iterator it = file.begin();
+				it != file.end(); ++it) {
+			log_file* log = new log_file(*it);
+			if (std::distance(it,file.end()) == 1 && !mask.empty()) { log->is_dag_log = true; }
+			if (strcmp(log->path.c_str(), UNIX_NULL_FILE) == 0) {
+				delete log;
+				continue;
+			}
+			logs.push_back(log);
+		}
+		return internalInitialize( c, p, s );
+	}
+
 	TemporaryPrivSentry temp_priv;
-	if (!use_async && m_set_user_priv && user_ids_are_inited() &&
+	if (m_set_user_priv && user_ids_are_inited() &&
 		get_priv_state() != PRIV_USER && get_priv_state() != PRIV_USER_FINAL) {
 		set_user_priv();
 	}
@@ -337,22 +351,11 @@ WriteUserLog::initialize( const std::vector<const char *>& file, int c, int p, i
 			if (first) {
 				// The first entry in the vector is the user's userlog, which we rarely want to fsync
 				// subsequent ones are the dagman nodes.log, which we (for now) we usually want to fsync
-				if (!use_async) {
-					log->set_should_fsync(param_boolean("ENABLE_USERLOG_FSYNC", false));
-				}
+				log->set_should_fsync(param_boolean("ENABLE_USERLOG_FSYNC", false));
 				first = false;
 			}
 			//If last log and has dag log then set apply_mask to true
 			if (std::distance(it,file.end()) == 1 && !mask.empty()) { log->is_dag_log = true; }
-
-			if (use_async) {
-				if (strcmp(log->path.c_str(), UNIX_NULL_FILE) == 0) {
-					delete log;
-					continue;
-				}
-				logs.push_back(log);
-				continue;
-			}
 
 			if(!openFile(log->path.c_str(), true, m_enable_locking, true, log->lock, log->fd) ) {
 				dprintf(D_ALWAYS, "WriteUserLog::initialize: failed to open file %s\n", log->path.c_str() );
@@ -658,7 +661,6 @@ WriteUserLog::log_file& WriteUserLog::log_file::operator=(const WriteUserLog::lo
 		fd = rhs.fd;
 		lock = rhs.lock;
 		should_fsync = rhs.should_fsync;
-		is_dag_log = rhs.is_dag_log;
 		rhs.copied = true;
 		user_priv_flag = rhs.user_priv_flag;
 	}
@@ -1570,14 +1572,6 @@ WriteUserLog::queueAsyncUserLogWrite(const WriteUserLog::log_file& log,
 }
 
 bool
-WriteUserLog::queueAsyncWriteEvent(const WriteUserLog::log_file& log, ULogEvent *event, int format_opts)
-{
-	std::string payload;
-	return format_event_to_string(event, format_opts, payload) &&
-		queueAsyncUserLogWrite(log, payload);
-}
-
-bool
 WriteUserLog::doWriteGlobalEvent( ULogEvent* event )
 {
 	log_file log;
@@ -1671,7 +1665,9 @@ WriteUserLog::writeEvent ( ULogEvent *event,
 			int fmt_opts = m_format_opts;
 			if ((*p)->is_dag_log) { fmt_opts &= ~(ULogEvent::formatOpt::XML); }
 			if (use_async) {
-				if (!queueAsyncWriteEvent(**p, event, fmt_opts)) {
+				std::string payload;
+				if (!format_event_to_string(event, fmt_opts, payload) ||
+					!queueAsyncUserLogWrite(**p, payload)) {
 					dprintf( D_ALWAYS, "WARNING: WriteUserLog::writeEvent async queue failed on normal log %s!\n", (*p)->path.c_str() );
 					ret = false;
 				}
@@ -1752,7 +1748,9 @@ WriteUserLog::writeJobAdInfoEvent(char const *attrsToWrite, log_file& log, ULogE
 		info_event.proc = m_proc;
 		info_event.subproc = m_subproc;
 		if (!is_global_event && asyncUserLogEnabled()) {
-			if (!queueAsyncWriteEvent(log, &info_event, format_opts)) {
+			std::string payload;
+			if (!format_event_to_string(&info_event, format_opts, payload) ||
+				!queueAsyncUserLogWrite(log, payload)) {
 				dprintf(D_ALWAYS, "WARNING: WriteUserLog::writeJobAdInfoEvent async queue failed on log %s!\n",
 					log.path.c_str());
 			}

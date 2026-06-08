@@ -18,26 +18,6 @@
 #endif
 
 static bool
-lookup_required_string(classad::ClassAd &ad, const char *attr, std::string &value)
-{
-	if (!ad.LookupString(attr, value) || value.empty()) {
-		dprintf(D_ALWAYS, "async user log helper: missing or empty %s\n", attr);
-		return false;
-	}
-	return true;
-}
-
-static bool
-lookup_required_int(classad::ClassAd &ad, const char *attr, long long &value)
-{
-	if (!ad.LookupInteger(attr, value)) {
-		dprintf(D_ALWAYS, "async user log helper: missing or invalid %s\n", attr);
-		return false;
-	}
-	return true;
-}
-
-static bool
 switch_identity(uid_t uid, gid_t gid, uid_t &old_uid, gid_t &old_gid)
 {
 	old_uid = geteuid();
@@ -137,9 +117,16 @@ process_command(const std::string &line)
 	long long uid = -1;
 	long long gid = -1;
 	std::string path;
-	if (!lookup_required_string(ad, "Path", path) ||
-		!lookup_required_int(ad, "Uid", uid) ||
-		!lookup_required_int(ad, "Gid", gid)) {
+	if (!ad.LookupString("Path", path) || path.empty()) {
+		dprintf(D_ALWAYS, "async user log helper: missing or empty Path\n");
+		return false;
+	}
+	if (!ad.LookupInteger("Uid", uid)) {
+		dprintf(D_ALWAYS, "async user log helper: missing or invalid Uid\n");
+		return false;
+	}
+	if (!ad.LookupInteger("Gid", gid)) {
+		dprintf(D_ALWAYS, "async user log helper: missing or invalid Gid\n");
 		return false;
 	}
 	if (!fullpath(path.c_str())) {
@@ -202,23 +189,21 @@ find_first_command_offset(int fd)
 	}
 }
 
-static bool
+static void
 commit_command_offset(int fd, const char *command_path, off_t offset)
 {
 	if (offset <= 0) {
-		return true;
+		return;
 	}
 	if (fallocate(fd, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE, 0, offset) < 0) {
 		dprintf(D_ALWAYS, "async user log helper: failed to punch command-file hole through offset %lld: errno %d (%s)\n",
 			(long long)offset, errno, strerror(errno));
-		return false;
+		return;
 	}
 	if (condor_fdatasync(fd, command_path) != 0) {
 		dprintf(D_ALWAYS, "async user log helper: failed to fsync command file %s after hole punch: errno %d (%s)\n",
 			command_path, errno, strerror(errno));
-		return false;
 	}
-	return true;
 }
 
 int

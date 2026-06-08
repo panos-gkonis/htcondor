@@ -318,7 +318,6 @@ public:
 	bool prepareAsyncUserLog();
 	bool queueAsyncUserLogWrite(const WriteUserLog::log_file& log,
 		const std::string &payload);
-	bool queueAsyncWriteEvent(const WriteUserLog::log_file& log, ULogEvent *event, int format_opts);
 	void writeJobAdInfoEvent(char const *attrsToWrite,
 		WriteUserLog::log_file& log, ULogEvent *event, const ClassAd *param_jobad,
 		bool is_global_event, int format_opts );
