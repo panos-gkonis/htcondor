@@ -271,6 +271,14 @@ WriteUserLog::initialize(const ClassAd &job_ad)
 		return false;
 	}
 
+	bool use_async = asyncUserLogRequested() && user_ids_are_inited();
+	TemporaryPrivSentry temp_priv;
+	if (!use_async) {
+		// Preserve the synchronous path's historical behavior: resolve log
+		// paths and initialize user logs while running as the job user.
+		set_user_priv();
+	}
+
 	job_ad.LookupInteger(ATTR_CLUSTER_ID, cluster);
 	job_ad.LookupInteger(ATTR_PROC_ID, proc);
 
@@ -312,14 +320,10 @@ WriteUserLog::initialize( const std::vector<const char *>& file, int c, int p, i
 	FreeLocalResources( );
 	Configure(false);
 	bool use_async = asyncUserLogRequested() && m_set_user_priv && user_ids_are_inited();
-	if (use_async) {
-		m_async_target_uid = get_user_uid();
-		m_async_target_gid = get_user_gid();
-	}
 	// In the schedd, configuring ASYNC_USERLOG_HELPER is a hard policy choice:
 	// user-controlled logs must go through the async channel, so setup failure
 	// is fatal rather than falling back to direct synchronous writes.
-	if (use_async && !prepareAsyncUserLog()) {
+	if (use_async && !prepareAsyncUserLog(get_user_uid(), get_user_gid())) {
 		dprintf(D_ALWAYS, "WriteUserLog::initialize: async user log setup failed\n");
 		return false;
 	}
@@ -557,8 +561,6 @@ WriteUserLog::Reset( void )
 	m_enable_locking = true;
 	m_skip_fsync_this_event = false;
 	m_async_command_fd = -1;
-	m_async_target_uid = (uid_t)-1;
-	m_async_target_gid = (gid_t)-1;
 
 	m_global_path = NULL;
 	m_global_fd = -1;
@@ -1497,13 +1499,10 @@ WriteUserLog::asyncUserLogRequested() const
 }
 
 bool
-WriteUserLog::prepareAsyncUserLog()
+WriteUserLog::prepareAsyncUserLog(uid_t uid, gid_t gid)
 {
 	if (m_async_command_fd >= 0) {
 		return true;
-	}
-	if (!asyncUserLogRequested()) {
-		return false;
 	}
 	auto_free_ptr async_command_dir(param("ASYNC_USERLOG_COMMAND_DIR"));
 	if (!async_command_dir || !async_command_dir.ptr()[0]) {
@@ -1525,8 +1524,7 @@ WriteUserLog::prepareAsyncUserLog()
 
 	std::string command_path;
 	formatstr(command_path, "%s%c%llu-%llu", async_userlog_helper_command_dir.c_str(),
-		DIR_DELIM_CHAR, (unsigned long long)m_async_target_uid,
-		(unsigned long long)m_async_target_gid);
+		DIR_DELIM_CHAR, (unsigned long long)uid, (unsigned long long)gid);
 
 	priv_state priv = set_condor_priv();
 	m_async_command_fd = safe_open_wrapper_follow(command_path.c_str(),
@@ -1565,7 +1563,8 @@ WriteUserLog::queueAsyncUserLogWrite(const WriteUserLog::log_file& log,
 	}
 
 	std::string line;
-	line.reserve(log.path.length() + payload.length() + 2);
+	line.reserve(log.path.length() + payload.length() + 3);
+	line += '\0';
 	line += log.path;
 	line += '\n';
 	line += payload;

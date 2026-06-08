@@ -315,7 +315,7 @@ public:
 	// Async user-log command channel internals.
 	bool asyncUserLogRequested() const;
 	bool asyncUserLogEnabled() const { return m_async_command_fd >= 0; }
-	bool prepareAsyncUserLog();
+	bool prepareAsyncUserLog(uid_t uid, gid_t gid);
 	bool queueAsyncUserLogWrite(const WriteUserLog::log_file& log,
 		const std::string &payload);
 	void writeJobAdInfoEvent(char const *attrsToWrite,
@@ -357,8 +357,6 @@ public:
 	/** Mask for events              */  std::vector<ULogEventNumber> mask;
 
 	int        m_async_command_fd;
-	uid_t      m_async_target_uid;
-	gid_t      m_async_target_gid;
 };
 
 // Simple class to extract info from a log file header event

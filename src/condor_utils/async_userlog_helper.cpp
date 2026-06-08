@@ -11,6 +11,7 @@
 #include <string>
 #include <limits>
 #include <map>
+#include <algorithm>
 
 #include <linux/falloc.h>
 
@@ -18,37 +19,7 @@
 #define SEEK_DATA 3
 #endif
 
-static bool
-switch_identity(uid_t uid, gid_t gid, uid_t &old_uid, gid_t &old_gid)
-{
-	old_uid = geteuid();
-	old_gid = getegid();
-	if (setegid(gid) != 0) {
-		dprintf(D_ALWAYS, "async user log helper: setegid(%llu) failed: errno %d (%s)\n",
-			(unsigned long long)gid, errno, strerror(errno));
-		return false;
-	}
-	if (seteuid(uid) != 0) {
-		dprintf(D_ALWAYS, "async user log helper: seteuid(%llu) failed: errno %d (%s)\n",
-			(unsigned long long)uid, errno, strerror(errno));
-		setegid(old_gid);
-		return false;
-	}
-	return true;
-}
-
-static void
-restore_identity(uid_t old_uid, gid_t old_gid)
-{
-	if (seteuid(old_uid) != 0) {
-		dprintf(D_ALWAYS, "async user log helper: failed to restore uid %llu: errno %d (%s)\n",
-			(unsigned long long)old_uid, errno, strerror(errno));
-	}
-	if (setegid(old_gid) != 0) {
-		dprintf(D_ALWAYS, "async user log helper: failed to restore gid %llu: errno %d (%s)\n",
-			(unsigned long long)old_gid, errno, strerror(errno));
-	}
-}
+static constexpr size_t MAX_COMMAND_BUNCH_BYTES = 4 * 1024 * 1024;
 
 static bool
 ensure_parent_dir(const std::string &path, mode_t mode)
@@ -73,13 +44,20 @@ class UserLogFdCache
 {
 public:
 	UserLogFdCache(uid_t uid, gid_t gid) {
-		m_switched = switch_identity(uid, gid, m_old_uid, m_old_gid);
+		if (!set_user_ids(uid, gid)) {
+			dprintf(D_ALWAYS, "async user log helper: set_user_ids(%llu, %llu) failed\n",
+				(unsigned long long)uid, (unsigned long long)gid);
+			return;
+		}
+		m_old_priv = set_user_priv();
+		m_switched = true;
 	}
 
 	~UserLogFdCache() {
 		closeAll();
 		if (m_switched) {
-			restore_identity(m_old_uid, m_old_gid);
+			set_priv(m_old_priv);
+			uninit_user_ids();
 		}
 	}
 
@@ -137,8 +115,7 @@ private:
 	}
 
 	bool m_switched = false;
-	uid_t m_old_uid = 0;
-	gid_t m_old_gid = 0;
+	priv_state m_old_priv = PRIV_UNKNOWN;
 	std::map<std::string, int> m_fds;
 };
 
@@ -239,6 +216,17 @@ process_command_bunch(const std::string &buffer, uid_t uid, gid_t gid,
 
 	size_t cursor = 0;
 	size_t process_length = last_terminator + 1;
+	if (!buffer.empty() && buffer[0] != '\0') {
+		// Commands are separator-prefixed.  If a previous writer left a
+		// partial record behind, abandon it through the next separator.
+		size_t separator = buffer.find('\0');
+		if (separator == std::string::npos || separator >= process_length) {
+			return true;
+		}
+		commit_length = separator + 1;
+		cursor = separator + 1;
+	}
+
 	UserLogFdCache fd_cache(uid, gid);
 	while (cursor < process_length) {
 		size_t record_start = buffer.find_first_not_of('\0', cursor);
@@ -263,7 +251,7 @@ process_command_bunch(const std::string &buffer, uid_t uid, gid_t gid,
 	return true;
 }
 
-static bool
+static void
 process_command_file(const char *command_path, uid_t uid, gid_t gid)
 {
 	priv_state priv = set_condor_priv();
@@ -272,7 +260,7 @@ process_command_file(const char *command_path, uid_t uid, gid_t gid)
 	if (fd < 0) {
 		dprintf(D_ALWAYS, "async user log helper: failed to open command file %s: errno %d (%s)\n",
 			command_path, errno, strerror(errno));
-		return false;
+		return;
 	}
 
 	off_t offset = find_first_command_offset(fd);
@@ -280,14 +268,17 @@ process_command_file(const char *command_path, uid_t uid, gid_t gid)
 		dprintf(D_ALWAYS, "async user log helper: failed to seek command file %s to offset %lld: errno %d (%s)\n",
 			command_path, (long long)offset, errno, strerror(errno));
 		close(fd);
-		return false;
+		return;
 	}
 
 	bool ok = true;
 	std::string buffer;
 	char chunk[8192];
-	while (true) {
-		ssize_t n = read(fd, chunk, sizeof(chunk));
+	buffer.reserve(std::min(MAX_COMMAND_BUNCH_BYTES, sizeof(chunk)));
+	while (buffer.size() < MAX_COMMAND_BUNCH_BYTES) {
+		size_t remaining = MAX_COMMAND_BUNCH_BYTES - buffer.size();
+		size_t request = std::min(remaining, sizeof(chunk));
+		ssize_t n = read(fd, chunk, request);
 		if (n < 0) {
 			if (errno == EINTR) {
 				continue;
@@ -314,7 +305,6 @@ process_command_file(const char *command_path, uid_t uid, gid_t gid)
 	}
 
 	close(fd);
-	return ok;
 }
 
 static void
@@ -351,15 +341,9 @@ main(int argc, char **argv)
 	}
 	const char *command_dir = argv[1];
 
-	uid_t condor_uid = get_condor_uid();
-	gid_t condor_gid = get_condor_gid();
-	uid_t old_uid = 0;
-	gid_t old_gid = 0;
-	if (!switch_identity(condor_uid, condor_gid, old_uid, old_gid)) {
-		return 1;
-	}
+	priv_state priv = set_condor_priv();
 	bool made_dir = mkdir_and_parents_if_needed(command_dir, 0755, PRIV_UNKNOWN);
-	restore_identity(old_uid, old_gid);
+	set_priv(priv);
 	if (!made_dir) {
 		fprintf(stderr, "failed to create %s: %s\n", command_dir, strerror(errno));
 		return 1;
