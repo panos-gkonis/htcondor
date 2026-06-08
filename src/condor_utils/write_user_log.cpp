@@ -40,7 +40,6 @@
 
 #include <string>
 #include <algorithm>
-#include <memory>
 #include "basename.h"
 
 static pid_t async_userlog_helper_pid = 0;
@@ -97,15 +96,6 @@ start_async_userlog_helper()
 		return false;
 	}
 	return true;
-}
-
-static std::string
-json_quote(const std::string &value)
-{
-	std::string out = "\"";
-	classad::ClassAdJsonUnParser::UnparseAuxEscapeString(out, value);
-	out += "\"";
-	return out;
 }
 
 static bool
@@ -282,15 +272,6 @@ WriteUserLog::initialize(const ClassAd &job_ad)
 		return false;
 	}
 
-	Configure(false);
-	bool use_async = asyncUserLogRequested();
-
-	std::unique_ptr<TemporaryPrivSentry> temp_priv;
-	if (!use_async) {
-		temp_priv.reset(new TemporaryPrivSentry);
-		set_user_priv();
-	}
-
 	job_ad.LookupInteger(ATTR_CLUSTER_ID, cluster);
 	job_ad.LookupInteger(ATTR_PROC_ID, proc);
 
@@ -342,15 +323,13 @@ WriteUserLog::initialize( const std::vector<const char *>& file, int c, int p, i
 		}
 	}
 	if (use_async && !prepareAsyncUserLog()) {
-		dprintf(D_ALWAYS, "WriteUserLog::initialize: async user log setup failed; falling back to synchronous user log writes\n");
-		// ASYNC_TODO: make this a fatal error
-		use_async = false;
+		dprintf(D_ALWAYS, "WriteUserLog::initialize: async user log setup failed\n");
+		return false;
 	}
 
-	std::unique_ptr<TemporaryPrivSentry> temp_priv;
+	TemporaryPrivSentry temp_priv;
 	if (!use_async && m_set_user_priv && user_ids_are_inited() &&
 		get_priv_state() != PRIV_USER && get_priv_state() != PRIV_USER_FINAL) {
-		temp_priv.reset(new TemporaryPrivSentry);
 		set_user_priv();
 	}
 	size_t failed_init = 0; //Count of logs that failed to initialize
@@ -370,7 +349,6 @@ WriteUserLog::initialize( const std::vector<const char *>& file, int c, int p, i
 			if (std::distance(it,file.end()) == 1 && !mask.empty()) { log->is_dag_log = true; }
 
 			if (use_async) {
-				assignAsyncLogId(*log);
 				if (strcmp(log->path.c_str(), UNIX_NULL_FILE) != 0 &&
 					!queueAsyncUserLogCommand(*log, "open", nullptr, false)) {
 					dprintf(D_ALWAYS, "WriteUserLog::initialize: failed to queue async open for %s\n", log->path.c_str());
@@ -489,9 +467,6 @@ WriteUserLog::Configure( bool force )
 		dprintf(D_ALWAYS, "WriteUserLog: ignoring reconfigured ASYNC_USERLOG_COMMAND_FILE=%s; using initial value %s\n",
 			async_command_path.ptr(), async_userlog_configured_command_path.c_str());
 	}
-	if (!m_async_command_path && !async_userlog_configured_command_path.empty()) {
-		m_async_command_path = strdup(async_userlog_configured_command_path.c_str());
-	}
 
 	// TODO: revisit this if we let the job choose to enable or disable UTC, SUB_SECOND or ISO_DATE
 	// if we are merging job and defult flags, we need to do a better job than this.
@@ -589,10 +564,8 @@ WriteUserLog::Reset( void )
 
 	m_enable_locking = true;
 	m_skip_fsync_this_event = false;
-	m_async_command_path = NULL;
 	m_async_command_fd = -1;
 	m_async_command_sequence = 0;
-	m_async_log_sequence = 0;
 	m_async_target_uid = (uid_t)-1;
 	m_async_target_gid = (gid_t)-1;
 	formatstr(m_async_writer_id, "%d.%p", (int)getpid(), this);
@@ -651,10 +624,6 @@ WriteUserLog::FreeGlobalResources( bool final )
 		delete m_global_state;
 		m_global_state = NULL;
 	}
-	if (final && m_async_command_path) {
-		free(m_async_command_path);
-		m_async_command_path = NULL;
-	}
 
 	if (m_rotation_lock_path) {
 		free(m_rotation_lock_path);
@@ -705,7 +674,6 @@ WriteUserLog::log_file& WriteUserLog::log_file::operator=(const WriteUserLog::lo
 		lock = rhs.lock;
 		should_fsync = rhs.should_fsync;
 		is_dag_log = rhs.is_dag_log;
-		log_id = rhs.log_id;
 		rhs.copied = true;
 		user_priv_flag = rhs.user_priv_flag;
 	}
@@ -713,8 +681,7 @@ WriteUserLog::log_file& WriteUserLog::log_file::operator=(const WriteUserLog::lo
 }
 WriteUserLog::log_file::log_file(const log_file& orig) : path(orig.path),
 	lock(orig.lock), fd(orig.fd), copied(false), user_priv_flag(orig.user_priv_flag), 
-	is_dag_log(orig.is_dag_log), should_fsync(orig.should_fsync),
-	log_id(orig.log_id)
+	is_dag_log(orig.is_dag_log), should_fsync(orig.should_fsync)
 {
 	orig.copied = true;
 }
@@ -1554,11 +1521,11 @@ WriteUserLog::prepareAsyncUserLog()
 	if (!asyncUserLogRequested()) {
 		return false;
 	}
-	if (!m_async_command_path || !*m_async_command_path) {
+	if (async_userlog_configured_command_path.empty()) {
 		return false;
 	}
 
-	std::string dir = m_async_command_path;
+	std::string dir = async_userlog_configured_command_path;
 	size_t pos = dir.find_last_of("/\\");
 	if (pos != std::string::npos) {
 		dir.erase(pos);
@@ -1570,30 +1537,21 @@ WriteUserLog::prepareAsyncUserLog()
 	}
 
 	priv_state priv = set_condor_priv();
-	m_async_command_fd = safe_open_wrapper_follow(m_async_command_path,
+	m_async_command_fd = safe_open_wrapper_follow(async_userlog_configured_command_path.c_str(),
 		O_WRONLY | O_CREAT | O_APPEND, 0664);
 	set_priv(priv);
 	if (m_async_command_fd < 0) {
 		dprintf(D_ALWAYS, "WriteUserLog: failed to open async command file %s: errno %d (%s)\n",
-			m_async_command_path, errno, strerror(errno));
+			async_userlog_configured_command_path.c_str(), errno, strerror(errno));
 		return false;
 	}
-	async_userlog_helper_command_path = m_async_command_path;
+	async_userlog_helper_command_path = async_userlog_configured_command_path;
 	if (!start_async_userlog_helper()) {
 		close(m_async_command_fd);
 		m_async_command_fd = -1;
 		return false;
 	}
 	return true;
-}
-
-void
-WriteUserLog::assignAsyncLogId(WriteUserLog::log_file& log)
-{
-	if (log.log_id.empty()) {
-		formatstr(log.log_id, "%s.%llu", m_async_writer_id.c_str(),
-			++m_async_log_sequence);
-	}
 }
 
 bool
@@ -1610,23 +1568,28 @@ WriteUserLog::queueAsyncUserLogCommand(const WriteUserLog::log_file& log, const 
 	formatstr(command_id, "%d.%llu.%ld.%ld", (int)getpid(),
 		++m_async_command_sequence, (long)now.tv_sec, (long)now.tv_usec);
 
-	std::string line;
-	formatstr(line,
-		"{\"Version\":1,\"CommandId\":%s,\"WriterId\":%s,\"LogId\":%s,"
-		"\"Op\":%s,\"Path\":%s,\"Uid\":%llu,\"Gid\":%llu,"
-		"\"CreateMode\":\"0664\",\"DirMode\":\"0755\"",
-		json_quote(command_id).c_str(),
-		json_quote(m_async_writer_id).c_str(),
-		json_quote(log.log_id).c_str(),
-		json_quote(op).c_str(),
-		json_quote(log.path).c_str(),
-		(unsigned long long)m_async_target_uid,
-		(unsigned long long)m_async_target_gid);
+	std::string log_id;
+	formatstr(log_id, "%s.%s", m_async_writer_id.c_str(), log.path.c_str());
+
+	ClassAd command;
+	command.Assign("Version", 1);
+	command.Assign("CommandId", command_id);
+	command.Assign("WriterId", m_async_writer_id);
+	command.Assign("LogId", log_id);
+	command.Assign("Op", op);
+	command.Assign("Path", log.path);
+	command.Assign("Uid", (long long)m_async_target_uid);
+	command.Assign("Gid", (long long)m_async_target_gid);
+	command.Assign("CreateMode", "0664");
+	command.Assign("DirMode", "0755");
 	if (payload) {
-		formatstr_cat(line, ",\"Payload\":%s,\"Fsync\":%s",
-			json_quote(*payload).c_str(), fsync ? "true" : "false");
+		command.Assign("Payload", *payload);
+		command.Assign("Fsync", fsync);
 	}
-	line += "}\n";
+	std::string line;
+	classad::ClassAdJsonUnParser unparser(true);
+	unparser.Unparse(line, &command);
+	line += "\n";
 
 	priv_state priv = set_condor_priv();
 	bool ok = write_once(m_async_command_fd, line);

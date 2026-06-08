@@ -12,9 +12,7 @@
 #include <map>
 #include <string>
 
-#if !defined(WIN32)
 #include <linux/falloc.h>
-#endif
 
 #if !defined(SEEK_DATA)
 #define SEEK_DATA 3
@@ -61,9 +59,6 @@ lookup_required_int(classad::ClassAd &ad, const char *attr, long long &value)
 static bool
 switch_identity(uid_t uid, gid_t gid, uid_t &old_uid, gid_t &old_gid)
 {
-#if defined(WIN32)
-	return true;
-#else
 	old_uid = geteuid();
 	old_gid = getegid();
 	if (setegid(gid) != 0) {
@@ -78,13 +73,11 @@ switch_identity(uid_t uid, gid_t gid, uid_t &old_uid, gid_t &old_gid)
 		return false;
 	}
 	return true;
-#endif
 }
 
 static void
 restore_identity(uid_t old_uid, gid_t old_gid)
 {
-#if !defined(WIN32)
 	if (seteuid(old_uid) != 0) {
 		dprintf(D_ALWAYS, "async user log helper: failed to restore uid %llu: errno %d (%s)\n",
 			(unsigned long long)old_uid, errno, strerror(errno));
@@ -93,7 +86,6 @@ restore_identity(uid_t old_uid, gid_t old_gid)
 		dprintf(D_ALWAYS, "async user log helper: failed to restore gid %llu: errno %d (%s)\n",
 			(unsigned long long)old_gid, errno, strerror(errno));
 	}
-#endif
 }
 
 static bool
@@ -159,14 +151,10 @@ process_command(const std::string &line, std::map<std::string, CachedLog> &logs)
 	long long version = 0;
 	long long uid = -1;
 	long long gid = -1;
-	std::string command_id;
-	std::string writer_id;
 	std::string log_id;
 	std::string op;
 	std::string path;
 	if (!lookup_required_int(ad, "Version", version) || version != 1 ||
-		!lookup_required_string(ad, "CommandId", command_id) ||
-		!lookup_required_string(ad, "WriterId", writer_id) ||
 		!lookup_required_string(ad, "LogId", log_id) ||
 		!lookup_required_string(ad, "Op", op) ||
 		!lookup_required_string(ad, "Path", path) ||
@@ -181,6 +169,21 @@ process_command(const std::string &line, std::map<std::string, CachedLog> &logs)
 	if (uid < 0 || gid < 0) {
 		dprintf(D_ALWAYS, "async user log helper: invalid uid/gid %lld/%lld\n", uid, gid);
 		return false;
+	}
+	if (op != "open" && op != "close" && op != "write") {
+		dprintf(D_ALWAYS, "async user log helper: invalid Op %s\n", op.c_str());
+		return false;
+	}
+
+	if (op == "close") {
+		auto it = logs.find(log_id);
+		if (it != logs.end()) {
+			if (it->second.fd >= 0) {
+				close(it->second.fd);
+			}
+			logs.erase(it);
+		}
+		return true;
 	}
 
 	std::string create_mode_text = "0664";
@@ -197,13 +200,6 @@ process_command(const std::string &line, std::map<std::string, CachedLog> &logs)
 
 	if (op == "open") {
 		return open_target(log, create_mode, dir_mode);
-	}
-	if (op == "close") {
-		if (log.fd >= 0) {
-			close(log.fd);
-		}
-		logs.erase(log_id);
-		return true;
 	}
 	if (op == "write") {
 		std::string payload;
@@ -228,8 +224,6 @@ process_command(const std::string &line, std::map<std::string, CachedLog> &logs)
 		}
 		return true;
 	}
-
-	dprintf(D_ALWAYS, "async user log helper: invalid Op %s\n", op.c_str());
 	return false;
 }
 
@@ -240,7 +234,6 @@ find_first_command_offset(int fd)
 	char chunk[8192];
 
 	while (true) {
-#if !defined(WIN32) && defined(SEEK_DATA)
 		off_t data_offset = lseek(fd, search_offset, SEEK_DATA);
 		if (data_offset < 0) {
 			if (errno == ENXIO) {
@@ -253,9 +246,6 @@ find_first_command_offset(int fd)
 			}
 			data_offset = search_offset;
 		}
-#else
-		off_t data_offset = search_offset;
-#endif
 		if (lseek(fd, data_offset, SEEK_SET) < 0) {
 			return 0;
 		}
@@ -286,9 +276,6 @@ commit_command_offset(int fd, const char *command_path, off_t offset)
 	if (offset <= 0) {
 		return true;
 	}
-#if defined(WIN32)
-	return true;
-#else
 	if (fallocate(fd, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE, 0, offset) < 0) {
 		dprintf(D_ALWAYS, "async user log helper: failed to punch command-file hole through offset %lld: errno %d (%s)\n",
 			(long long)offset, errno, strerror(errno));
@@ -300,7 +287,6 @@ commit_command_offset(int fd, const char *command_path, off_t offset)
 		return false;
 	}
 	return true;
-#endif
 }
 
 int
@@ -309,14 +295,11 @@ main(int argc, char **argv)
 	set_mySubSystem("ASYNC_USERLOG_HELPER", false, SUBSYSTEM_TYPE_TOOL);
 	config();
 
-	auto_free_ptr command_path(param("ASYNC_USERLOG_COMMAND_FILE"));
-	if (argc > 1) {
-		command_path.set(strdup(argv[1]));
-	}
-	if (!command_path) {
-		fprintf(stderr, "ASYNC_USERLOG_COMMAND_FILE must be set\n");
+	if (argc != 2) {
+		fprintf(stderr, "usage: %s <command-file>\n", argv[0]);
 		return 1;
 	}
+	const char *command_path = argv[1];
 
 	uid_t condor_uid = get_condor_uid();
 	gid_t condor_gid = get_condor_gid();
@@ -328,7 +311,7 @@ main(int argc, char **argv)
 	int fd = safe_open_wrapper_follow(command_path, O_RDWR | O_CREAT, 0664);
 	restore_identity(old_uid, old_gid);
 	if (fd < 0) {
-		fprintf(stderr, "failed to open %s: %s\n", command_path.ptr(), strerror(errno));
+		fprintf(stderr, "failed to open %s: %s\n", command_path, strerror(errno));
 		return 1;
 	}
 
@@ -362,7 +345,7 @@ main(int argc, char **argv)
 			buffer.erase(0, newline + 1);
 			offset += newline + 1;
 			process_command(line, logs);
-			commit_command_offset(fd, command_path.ptr(), offset);
+			commit_command_offset(fd, command_path, offset);
 		}
 	}
 
