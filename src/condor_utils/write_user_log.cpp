@@ -35,7 +35,6 @@
 #include "condor_attributes.h"
 #include "CondorError.h"
 #include "directory.h"
-#include "classad/jsonSink.h"
 #include "condor_daemon_core.h"
 #include "subsystem_info.h"
 
@@ -45,7 +44,7 @@
 
 static pid_t async_userlog_helper_pid = 0;
 static int async_userlog_helper_reaper = -1;
-static std::string async_userlog_helper_command_path;
+static std::string async_userlog_helper_command_dir;
 
 static bool start_async_userlog_helper();
 
@@ -63,7 +62,7 @@ static bool
 start_async_userlog_helper()
 {
 	if (!daemonCore || async_userlog_helper_pid > 0 ||
-		async_userlog_helper_command_path.empty()) {
+		async_userlog_helper_command_dir.empty()) {
 		return async_userlog_helper_pid > 0;
 	}
 	if (async_userlog_helper_reaper < 0) {
@@ -83,7 +82,7 @@ start_async_userlog_helper()
 	}
 	ArgList args;
 	args.AppendArg("condor_async_userlog_helper");
-	args.AppendArg(async_userlog_helper_command_path);
+	args.AppendArg(async_userlog_helper_command_dir);
 
 	OptionalCreateProcessArgs cpArgs;
 	async_userlog_helper_pid = daemonCore->CreateProcessNew(helper.ptr(), args,
@@ -317,6 +316,9 @@ WriteUserLog::initialize( const std::vector<const char *>& file, int c, int p, i
 		m_async_target_uid = get_user_uid();
 		m_async_target_gid = get_user_gid();
 	}
+	// In the schedd, configuring ASYNC_USERLOG_HELPER is a hard policy choice:
+	// user-controlled logs must go through the async channel, so setup failure
+	// is fatal rather than falling back to direct synchronous writes.
 	if (use_async && !prepareAsyncUserLog()) {
 		dprintf(D_ALWAYS, "WriteUserLog::initialize: async user log setup failed\n");
 		return false;
@@ -1503,36 +1505,36 @@ WriteUserLog::prepareAsyncUserLog()
 	if (!asyncUserLogRequested()) {
 		return false;
 	}
-	auto_free_ptr async_command_path(param("ASYNC_USERLOG_COMMAND_FILE"));
-	if (!async_command_path || !async_command_path.ptr()[0]) {
-		dprintf(D_ALWAYS, "WriteUserLog: ASYNC_USERLOG_COMMAND_FILE is not configured\n");
+	auto_free_ptr async_command_dir(param("ASYNC_USERLOG_COMMAND_DIR"));
+	if (!async_command_dir || !async_command_dir.ptr()[0]) {
+		dprintf(D_ALWAYS, "WriteUserLog: ASYNC_USERLOG_COMMAND_DIR is not configured\n");
 		return false;
 	}
-	if (async_userlog_helper_command_path.empty()) {
-		async_userlog_helper_command_path = async_command_path.ptr();
-	} else if (strcmp(async_command_path.ptr(), async_userlog_helper_command_path.c_str()) != 0) {
-		dprintf(D_ALWAYS, "WriteUserLog: ignoring reconfigured ASYNC_USERLOG_COMMAND_FILE=%s; using initial value %s\n",
-			async_command_path.ptr(), async_userlog_helper_command_path.c_str());
+	if (async_userlog_helper_command_dir.empty()) {
+		async_userlog_helper_command_dir = async_command_dir.ptr();
+	} else if (strcmp(async_command_dir.ptr(), async_userlog_helper_command_dir.c_str()) != 0) {
+		dprintf(D_ALWAYS, "WriteUserLog: ignoring reconfigured ASYNC_USERLOG_COMMAND_DIR=%s; using initial value %s\n",
+			async_command_dir.ptr(), async_userlog_helper_command_dir.c_str());
 	}
 
-	std::string dir = async_userlog_helper_command_path;
-	size_t pos = dir.find_last_of("/\\");
-	if (pos != std::string::npos) {
-		dir.erase(pos);
-		if (!dir.empty() && !mkdir_and_parents_if_needed(dir.c_str(), 0755, PRIV_CONDOR)) {
-			dprintf(D_ALWAYS, "WriteUserLog: failed to create async command directory %s: errno %d (%s)\n",
-				dir.c_str(), errno, strerror(errno));
-			return false;
-		}
+	if (!mkdir_and_parents_if_needed(async_userlog_helper_command_dir.c_str(), 0755, PRIV_CONDOR)) {
+		dprintf(D_ALWAYS, "WriteUserLog: failed to create async command directory %s: errno %d (%s)\n",
+			async_userlog_helper_command_dir.c_str(), errno, strerror(errno));
+		return false;
 	}
+
+	std::string command_path;
+	formatstr(command_path, "%s%c%llu-%llu", async_userlog_helper_command_dir.c_str(),
+		DIR_DELIM_CHAR, (unsigned long long)m_async_target_uid,
+		(unsigned long long)m_async_target_gid);
 
 	priv_state priv = set_condor_priv();
-	m_async_command_fd = safe_open_wrapper_follow(async_userlog_helper_command_path.c_str(),
+	m_async_command_fd = safe_open_wrapper_follow(command_path.c_str(),
 		O_WRONLY | O_CREAT | O_APPEND, 0664);
 	set_priv(priv);
 	if (m_async_command_fd < 0) {
 		dprintf(D_ALWAYS, "WriteUserLog: failed to open async command file %s: errno %d (%s)\n",
-			async_userlog_helper_command_path.c_str(), errno, strerror(errno));
+			command_path.c_str(), errno, strerror(errno));
 		return false;
 	}
 	if (!start_async_userlog_helper()) {
@@ -1550,16 +1552,24 @@ WriteUserLog::queueAsyncUserLogWrite(const WriteUserLog::log_file& log,
 	if (!asyncUserLogEnabled()) {
 		return false;
 	}
+	if (log.path.find('\n') != std::string::npos ||
+		log.path.find('\0') != std::string::npos) {
+		dprintf(D_ALWAYS, "WriteUserLog: async command path contains an unsupported delimiter: %s\n",
+			log.path.c_str());
+		return false;
+	}
+	if (payload.find('\0') != std::string::npos) {
+		dprintf(D_ALWAYS, "WriteUserLog: async command payload for %s contains an unsupported NUL byte\n",
+			log.path.c_str());
+		return false;
+	}
 
-	ClassAd command;
-	command.Assign("Path", log.path);
-	command.Assign("Uid", (long long)m_async_target_uid);
-	command.Assign("Gid", (long long)m_async_target_gid);
-	command.Assign("Payload", payload);
 	std::string line;
-	classad::ClassAdJsonUnParser unparser(true);
-	unparser.Unparse(line, &command);
-	line += "\n";
+	line.reserve(log.path.length() + payload.length() + 2);
+	line += log.path;
+	line += '\n';
+	line += payload;
+	line += '\0';
 
 	priv_state priv = set_condor_priv();
 	bool ok = write_once(m_async_command_fd, line);
