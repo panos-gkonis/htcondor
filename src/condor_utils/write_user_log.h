@@ -313,7 +313,6 @@ public:
 		int format_opts);
 
 	// Async user-log command channel internals.
-	bool asyncUserLogRequested() const;
 	bool asyncUserLogEnabled() const { return m_async_command_fd >= 0; }
 	bool prepareAsyncUserLog(uid_t uid, gid_t gid);
 	bool queueAsyncUserLogWrite(const WriteUserLog::log_file& log,

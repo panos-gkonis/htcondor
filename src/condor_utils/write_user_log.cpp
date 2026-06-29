@@ -105,6 +105,22 @@ write_once(int fd, const std::string &bytes)
 }
 
 static bool
+async_userlog_path_is_supported(const std::string &path)
+{
+	return path.find('\n') == std::string::npos &&
+		path.find('\0') == std::string::npos;
+}
+
+static bool
+async_userlog_requested(bool userlog_enable)
+{
+	SubsystemInfo *subsys = get_mySubSystem();
+	auto_free_ptr helper(param("ASYNC_USERLOG_HELPER"));
+	return userlog_enable && daemonCore && subsys && subsys->isType(SUBSYSTEM_TYPE_SCHEDD) &&
+		helper && helper.ptr()[0];
+}
+
+static bool
 format_event_to_string( ULogEvent *event, int format_opts, std::string &output )
 {
 	ClassAd* eventAd = NULL;
@@ -271,7 +287,7 @@ WriteUserLog::initialize(const ClassAd &job_ad)
 		return false;
 	}
 
-	bool use_async = asyncUserLogRequested() && user_ids_are_inited();
+	bool use_async = async_userlog_requested(m_userlog_enable) && user_ids_are_inited();
 	TemporaryPrivSentry temp_priv;
 	if (!use_async) {
 		// Preserve the synchronous path's historical behavior: resolve log
@@ -319,7 +335,7 @@ WriteUserLog::initialize( const std::vector<const char *>& file, int c, int p, i
 		// Save parameter info
 	FreeLocalResources( );
 	Configure(false);
-	bool use_async = asyncUserLogRequested() && m_set_user_priv && user_ids_are_inited();
+	bool use_async = async_userlog_requested(m_userlog_enable) && m_set_user_priv && user_ids_are_inited();
 	// In the schedd, configuring ASYNC_USERLOG_HELPER is a hard policy choice:
 	// user-controlled logs must go through the async channel, so setup failure
 	// is fatal rather than falling back to direct synchronous writes.
@@ -329,13 +345,19 @@ WriteUserLog::initialize( const std::vector<const char *>& file, int c, int p, i
 	}
 
 	if (m_userlog_enable && use_async) {
-		for (std::vector<const char*>::const_iterator it = file.begin();
-				it != file.end(); ++it) {
-			log_file* log = new log_file(*it);
-			if (std::distance(it,file.end()) == 1 && !mask.empty()) { log->is_dag_log = true; }
+		for (size_t i = 0; i < file.size(); ++i) {
+			log_file* log = new log_file(file[i]);
+			if (i + 1 == file.size() && !mask.empty()) { log->is_dag_log = true; }
 			if (strcmp(log->path.c_str(), UNIX_NULL_FILE) == 0) {
 				delete log;
 				continue;
+			}
+			if (!async_userlog_path_is_supported(log->path)) {
+				dprintf(D_ALWAYS,
+					"WriteUserLog::initialize: async user log path contains an unsupported delimiter: %s\n",
+					log->path.c_str());
+				delete log;
+				return false;
 			}
 			logs.push_back(log);
 		}
@@ -350,10 +372,9 @@ WriteUserLog::initialize( const std::vector<const char *>& file, int c, int p, i
 	size_t failed_init = 0; //Count of logs that failed to initialize
 	if ( m_userlog_enable ) {
 		bool first = true;
-		for(std::vector<const char*>::const_iterator it = file.begin();
-				it != file.end(); ++it) {
+		for(size_t i = 0; i < file.size(); ++i) {
 
-			log_file* log = new log_file(*it);
+			log_file* log = new log_file(file[i]);
 			if (first) {
 				// The first entry in the vector is the user's userlog, which we rarely want to fsync
 				// subsequent ones are the dagman nodes.log, which we (for now) we usually want to fsync
@@ -361,7 +382,7 @@ WriteUserLog::initialize( const std::vector<const char *>& file, int c, int p, i
 				first = false;
 			}
 			//If last log and has dag log then set apply_mask to true
-			if (std::distance(it,file.end()) == 1 && !mask.empty()) { log->is_dag_log = true; }
+			if (i + 1 == file.size() && !mask.empty()) { log->is_dag_log = true; }
 
 			if(!openFile(log->path.c_str(), true, m_enable_locking, true, log->lock, log->fd) ) {
 				dprintf(D_ALWAYS, "WriteUserLog::initialize: failed to open file %s\n", log->path.c_str() );
@@ -1490,15 +1511,6 @@ WriteUserLog::doWriteEvent( int fd, ULogEvent *event, int format_opts )
 }
 
 bool
-WriteUserLog::asyncUserLogRequested() const
-{
-	SubsystemInfo *subsys = get_mySubSystem();
-	auto_free_ptr helper(param("ASYNC_USERLOG_HELPER"));
-	return m_userlog_enable && daemonCore && subsys && subsys->isType(SUBSYSTEM_TYPE_SCHEDD) &&
-		helper && helper.ptr()[0];
-}
-
-bool
 WriteUserLog::prepareAsyncUserLog(uid_t uid, gid_t gid)
 {
 	if (m_async_command_fd >= 0) {
@@ -1548,12 +1560,6 @@ WriteUserLog::queueAsyncUserLogWrite(const WriteUserLog::log_file& log,
 	const std::string &payload)
 {
 	if (!asyncUserLogEnabled()) {
-		return false;
-	}
-	if (log.path.find('\n') != std::string::npos ||
-		log.path.find('\0') != std::string::npos) {
-		dprintf(D_ALWAYS, "WriteUserLog: async command path contains an unsupported delimiter: %s\n",
-			log.path.c_str());
 		return false;
 	}
 	if (payload.find('\0') != std::string::npos) {

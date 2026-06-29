@@ -201,7 +201,7 @@ commit_command_offset(int fd, const char *command_path, off_t offset)
 	}
 }
 
-static bool
+static void
 process_command_bunch(const std::string &buffer, uid_t uid, gid_t gid,
 	size_t &commit_length)
 {
@@ -211,7 +211,7 @@ process_command_bunch(const std::string &buffer, uid_t uid, gid_t gid,
 	// this scan was in progress.
 	size_t last_terminator = buffer.find_last_of('\0');
 	if (last_terminator == std::string::npos) {
-		return true;
+		return;
 	}
 
 	size_t cursor = 0;
@@ -221,7 +221,7 @@ process_command_bunch(const std::string &buffer, uid_t uid, gid_t gid,
 		// partial record behind, abandon it through the next separator.
 		size_t separator = buffer.find('\0');
 		if (separator == std::string::npos || separator >= process_length) {
-			return true;
+			return;
 		}
 		commit_length = separator + 1;
 		cursor = separator + 1;
@@ -232,23 +232,22 @@ process_command_bunch(const std::string &buffer, uid_t uid, gid_t gid,
 		size_t record_start = buffer.find_first_not_of('\0', cursor);
 		if (record_start == std::string::npos || record_start >= process_length) {
 			commit_length = process_length;
-			return true;
+			return;
 		}
 
 		size_t record_end = buffer.find('\0', record_start);
 		if (record_end == std::string::npos || record_end >= process_length) {
-			return true;
+			return;
 		}
 
 		bool ok = process_command(buffer.substr(record_start, record_end - record_start),
 			fd_cache);
 		commit_length = record_end + 1;
 		if (!ok) {
-			return false;
+			return;
 		}
 		cursor = record_end + 1;
 	}
-	return true;
 }
 
 static void
@@ -271,7 +270,6 @@ process_command_file(const char *command_path, uid_t uid, gid_t gid)
 		return;
 	}
 
-	bool ok = true;
 	std::string buffer;
 	char chunk[8192];
 	buffer.reserve(std::min(MAX_COMMAND_BUNCH_BYTES, sizeof(chunk)));
@@ -285,8 +283,8 @@ process_command_file(const char *command_path, uid_t uid, gid_t gid)
 			}
 			dprintf(D_ALWAYS, "async user log helper: read(%s) failed: errno %d (%s)\n",
 				command_path, errno, strerror(errno));
-			ok = false;
-			break;
+			close(fd);
+			return;
 		}
 		if (n == 0) {
 			break;
@@ -295,13 +293,18 @@ process_command_file(const char *command_path, uid_t uid, gid_t gid)
 	}
 
 	size_t commit_length = 0;
-	if (ok) {
-		ok = process_command_bunch(buffer, uid, gid, commit_length);
-		if (commit_length > 0) {
-			priv = set_condor_priv();
-			commit_command_offset(fd, command_path, offset + commit_length);
-			set_priv(priv);
-		}
+	if (buffer.size() == MAX_COMMAND_BUNCH_BYTES &&
+		buffer.find('\0') == std::string::npos) {
+		dprintf(D_ALWAYS, "async user log helper: command file %s has no complete record in %zu bytes; discarding\n",
+			command_path, buffer.size());
+		commit_length = buffer.size();
+	} else {
+		process_command_bunch(buffer, uid, gid, commit_length);
+	}
+	if (commit_length > 0) {
+		priv = set_condor_priv();
+		commit_command_offset(fd, command_path, offset + commit_length);
+		set_priv(priv);
 	}
 
 	close(fd);
