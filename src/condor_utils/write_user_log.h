@@ -311,6 +311,12 @@ public:
 		bool is_global_event,
 		bool is_header_event,
 		int format_opts);
+
+	// Async user-log command channel internals.
+	bool asyncUserLogEnabled() const { return m_async_command_fd >= 0; }
+	bool prepareAsyncUserLog(uid_t uid, gid_t gid);
+	bool queueAsyncUserLogWrite(const WriteUserLog::log_file& log,
+		const std::string &payload);
 	void writeJobAdInfoEvent(char const *attrsToWrite,
 		WriteUserLog::log_file& log, ULogEvent *event, const ClassAd *param_jobad,
 		bool is_global_event, int format_opts );
@@ -348,6 +354,8 @@ public:
 	/** switch to user priv?         */  bool       m_set_user_priv;
 	/** Creator Name (schedd name)   */  char     * m_creator_name;
 	/** Mask for events              */  std::vector<ULogEventNumber> mask;
+
+	int        m_async_command_fd;
 };
 
 // Simple class to extract info from a log file header event

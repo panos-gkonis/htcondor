@@ -2474,6 +2474,16 @@ default=false
 type=bool
 tags=read_user_log
 
+[ASYNC_USERLOG_COMMAND_DIR]
+default=$(SPOOL)/userlog_commands
+type=string
+tags=user_log
+
+[ASYNC_USERLOG_HELPER]
+default=
+type=string
+tags=user_log
+
 [EVENT_LOG]
 default=
 type=string
